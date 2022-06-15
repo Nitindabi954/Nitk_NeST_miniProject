@@ -2,8 +2,9 @@
 # Copyright (c) 2019-2020 NITK Surathkal
 
 """Handles collection of results (raw data)"""
-
+import inspect
 import json
+import sys
 from multiprocessing import Manager
 from ..topology_map import TopologyMap
 from .pack import Pack
@@ -339,3 +340,41 @@ class Iperf3ServerResults:
     def output_to_file():
         """Outputs the aggregated iperf3 stats to file"""
         Results.output_to_file(iperf3_server_results_q, "iperf3Server")
+
+class DumpResults:
+    """Dump result to  output file"""
+
+    '''
+    @staticmethod
+    def dump_to_json():
+        classList = ["SsResults", "NetperfResults", "Iperf3Results", 
+        "TcResults", "PingResults", "CoapResults"]
+
+        for classlist in classList:
+            classlist.output_to_file()
+    '''
+
+
+    classlist = []
+
+    @staticmethod
+    def dump_to_json():
+        """Dump result as a json file"""
+
+        for name, obj in inspect.getmembers(sys.modules[__name__]):
+            if inspect.isclass(obj) and name != "Results":
+                DumpResults.classlist.append(obj)
+        for classname in DumpResults.classlist:
+            if hasattr(classname, "output_to_file") and callable(
+                getattr(classname, "output_to_file")
+            ):
+                classname.output_to_file()
+
+    @staticmethod
+    def clean_output_files():
+        """Remove all dump files"""
+        for classname in DumpResults.classlist:
+            if hasattr(classname, "remove_all_results") and callable(
+                getattr(classname, "remove_all_results")
+            ):
+                classname.remove_all_results()

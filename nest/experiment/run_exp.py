@@ -13,6 +13,7 @@ from tqdm import tqdm
 from nest.logging_helper import DepedencyCheckFilter
 from nest import config
 from nest.topology_map import TopologyMap
+from nest.experiment.tools import Tools
 from nest.clean_up import kill_processes, tcp_modules_clean_up
 from nest import engine
 from .pack import Pack
@@ -26,6 +27,7 @@ from .results import (
     TcResults,
     PingResults,
     CoAPResults,
+    DumpResults,
 )
 
 # Import parsers
@@ -63,12 +65,7 @@ def run_experiment(exp):
     """
 
     tcp_modules_helper(exp)
-    tools = ["netperf", "ss", "tc", "iperf3", "ping", "coap", "server"]
-    Runners = namedtuple("runners", tools)
-    exp_runners = Runners(
-        netperf=[], ss=[], tc=[], iperf3=[], ping=[], coap=[], server=[]
-    )  # Runner objects
-
+    tools = Tools()
     # Keep track of all destination nodes [to ensure netperf, iperf3 and
     # coap server is run at most once]
     destination_nodes = {"netperf": set(), "iperf3": set(), "coap": set()}
@@ -81,7 +78,7 @@ def run_experiment(exp):
     # Overall experiment stop time considering all flows
     exp_end_t = float("-inf")
 
-    dependencies = get_dependency_status(tools)
+    dependencies = tools.dependency
 
     ss_required = False
     ss_filters = set()
@@ -118,14 +115,14 @@ def run_experiment(exp):
             #   connection also we must ignore.
             ss_filters.add("sport != 12865 and dport != 12865")
             ss_required = True
-            (tcp_runners, ss_schedules,) = setup_tcp_flows(
+            (tcp_runners, ss_schedules,)= setup_tcp_flows(
                 dependencies["netperf"],
                 flow,
                 ss_schedules,
                 destination_nodes["netperf"],
             )
 
-            exp_runners.netperf.extend(tcp_runners)
+            tools.add_exp_runners("netperf",tcp_runners)
 
             # Update destination nodes
             destination_nodes["netperf"].add(dst_ns)
@@ -138,8 +135,7 @@ def run_experiment(exp):
             #   connection also we must ignore.
             ss_filters.add("sport != 5201 and dport != 5201")
             udp_runners = setup_udp_flows(dependencies["iperf3"], flow)
-
-            exp_runners.iperf3.extend(udp_runners)
+            tools.add_exp_runners("iperf3",udp_runners)
 
             # Update destination nodes
             destination_nodes["iperf3"].add(dst_ns)
@@ -166,36 +162,55 @@ def run_experiment(exp):
         coap_runners = setup_coap_runners(
             dependencies["coap"], coap_flow, destination_nodes["coap"]
         )
-        exp_runners.coap.extend(coap_runners)
+        tools.add_exp_runners("coap",coap_runners)
         destination_nodes["coap"].add(dst_ns)
 
     if ss_required:
         ss_filter = " and ".join(ss_filters)
         ss_runners = setup_ss_runners(dependencies["ss"], ss_schedules, ss_filter)
-        exp_runners.ss.extend(ss_runners)
+        tools.add_exp_runners("ss",ss_runners)
 
     tc_runners = setup_tc_runners(dependencies["tc"], exp.qdisc_stats, exp_end_t)
-    exp_runners.tc.extend(tc_runners)
+    tools.add_exp_runners("tc",tc_runners)
 
     ping_runners = setup_ping_runners(dependencies["ping"], ping_schedules)
-    exp_runners.ping.extend(ping_runners)
+    tools.add_exp_runners("ping",ping_runners)
 
     try:
         # Start traffic generation
-        run_workers(setup_flow_workers(exp_runners, exp_end_t))
+        #run_workers(setup_flow_workers(tools.exp_runners, exp_end_t))
+
+        workers_flow = []
+        for runners in tools.exp_runners:
+            workers_flow.extend([Process(target=runner.run) for runner in runners])
+
+        # Add progress bar process
+        if config.get_value("show_progress_bar"):
+            workers_flow.extend([Process(target=progress_bar, args=(exp_end_t,))])
+
+        run_workers(workers_flow)
+
+       
+
 
         logger.info("Parsing statistics...")
 
-        exp_runners.server.extend(server_runner)
+        tools.add_exp_runners("server",server_runner)
 
         # Parse the stored statistics
-        run_workers(setup_parser_workers(exp_runners))
+        #run_workers(setup_parser_workers(tools.exp_runners))
+
+        workers_parser = []
+        for runners in tools.exp_runners:
+            workers_parser.extend([Process(target=runner.parse) for runner in runners])
+
+        run_workers(workers_parser)
 
         logger.info("Parsing statistics complete!")
         logger.info("Output results as JSON dump...")
 
         # Output results as JSON dumps
-        dump_json_ouputs()
+        DumpResults.dump_to_json()
 
         if config.get_value("readme_in_stats_folder"):
             # Copying README.txt to stats folder
@@ -310,6 +325,14 @@ def setup_plotter_workers():
     -------
     List[multiprocessing.Process]
         plotters
+    
+    """
+    """
+    plotters = [("plot_ss", SsResults), ("plot_netperf", NetperfResults), 
+            ("plot_iperf3", Iperf3Results), ("plot_tc", TcResults), ("plot_ping", PingResults)]
+
+    return [Process(target=plotter[0], args=(plotter[1].get_results(),)) for plotter in plotters]
+    
     """
     plotters = []
 
@@ -320,114 +343,6 @@ def setup_plotter_workers():
     plotters.append(Process(target=plot_ping, args=(PingResults.get_results(),)))
 
     return plotters
-
-
-def dump_json_ouputs():
-    """
-    Outputs experiment results as json dumps
-    """
-    SsResults.output_to_file()
-    NetperfResults.output_to_file()
-    Iperf3Results.output_to_file()
-    TcResults.output_to_file()
-    PingResults.output_to_file()
-    CoAPResults.output_to_file()
-    Iperf3ServerResults.output_to_file()
-
-
-def setup_flow_workers(exp_runners, exp_stop_time):
-    """
-    Setup flow generation and stats collection processes(netperf, ss, tc, iperf3...).
-
-    Also add a progress bar process for showing experiment progress.
-
-    Parameters
-    ----------
-    exp_runners: collections.NamedTuple
-        all(netperf, ping, ss, tc..) the runners
-    exp_stop_time: int
-        Time when experiment stops (in seconds)
-
-    Returns
-    -------
-    List[multiprocessing.Process]
-        flow generation and stats collection processes
-        + progress bar process
-    """
-    workers = []
-
-    for runners in exp_runners:
-        workers.extend([Process(target=runner.run) for runner in runners])
-
-    # Add progress bar process
-    if config.get_value("show_progress_bar"):
-        workers.extend([Process(target=progress_bar, args=(exp_stop_time,))])
-
-    return workers
-
-
-def setup_parser_workers(exp_runners):
-    """
-    Setup parsing processes
-
-    Parameters
-    ----------
-    exp_runners: collections.NamedTuple
-        all(netperf, ping, ss, tc..) the runners
-
-    Returns
-    -------
-    List[multiprocessing.Process]
-        parsers
-    """
-    parsers = []
-
-    for ss_runner in exp_runners.ss:
-        parsers.append(Process(target=ss_runner.parse))
-
-    for netperf_runner in exp_runners.netperf:
-        parsers.append(Process(target=netperf_runner.parse))
-
-    for iperf3_runner in exp_runners.iperf3:
-        parsers.append(Process(target=iperf3_runner.parse))
-
-    for tc_runner in exp_runners.tc:
-        parsers.append(Process(target=tc_runner.parse))
-
-    for ping_runner in exp_runners.ping:
-        parsers.append(Process(target=ping_runner.parse))
-
-    for coap_runner in exp_runners.coap:
-        parsers.append(Process(target=coap_runner.parse))
-
-    for server_runner in exp_runners.server:
-        parsers.append(Process(target=server_runner.parse))
-
-    return parsers
-
-
-def get_dependency_status(tools):
-    """
-    Checks for dependency
-
-    Parameters
-    ----------
-    tools: List[str]
-        list of tools to check for it's installation
-
-    Returns
-    -------
-    dict
-        contains information as to whether `tools` are installed
-    """
-    dependencies = {}
-    for dependency in tools:
-        # Check for the availability of aiocoap for CoAP emulation
-        if dependency == "coap":
-            dependencies[dependency] = is_package_installed("aiocoap")
-            continue
-        dependencies[dependency] = is_dependency_installed(dependency)
-    return dependencies
 
 
 def setup_tcp_flows(dependency, flow, ss_schedules, destination_nodes):
@@ -758,18 +673,11 @@ def cleanup():
     Clean up
     """
     # Remove results of the experiment
-    SsResults.remove_all_results()
-    NetperfResults.remove_all_results()
-    TcResults.remove_all_results()
-    PingResults.remove_all_results()
-    CoAPResults.remove_all_results()
-    Iperf3Results.remove_all_results()
-    Iperf3ServerResults.remove_all_results()
+    DumpResults.clean_output_files()
 
     # Clean up the configured TCP modules and kill processes
     tcp_modules_clean_up()
     kill_processes()
-
 
 # Helper methods
 # pylint: disable=too-many-arguments
@@ -809,3 +717,4 @@ def _get_start_stop_time_for_ss(
         )
 
     return ss_schedules
+

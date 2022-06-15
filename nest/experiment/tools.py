@@ -2,7 +2,7 @@
 # Copyright (c) 2019-2022 NITK Surathkal
 
 """Check if tool is installed and tool options are valid"""
-
+from collections import namedtuple
 from nest.engine.util import is_dependency_installed, is_package_installed
 from nest.input_validator import input_validator
 
@@ -30,6 +30,41 @@ class Tools:
 
         if not is_dependency_installed(self.tool_name):
             raise ValueError(f"{self.tool_name} is either invalid or not installed.")
+
+    def __init__(self):
+
+        self.tools = ["netperf", "ss", "tc", "iperf3", "ping", "coap", "server"]
+        self.dependency = self.get_dependency_status()
+
+        Runners = namedtuple("runners", self.tools)
+        self.exp_runners = Runners(
+             netperf=[], ss=[], tc=[], iperf3=[], ping=[], coap=[], server=[]
+        )  # Runner objects
+        #print(self.exp_runners)
+
+    def get_dependency_status(self):
+        """
+        Checks for dependency
+
+        Returns
+        -------
+        dict
+            contains information as to whether `tools` are installed
+        """
+
+        dependencies = {}
+        for dependency in self.tools:
+            # Check for the availability of aiocoap for CoAP emulation
+            if dependency == "coap":
+                dependencies[dependency] = is_package_installed("aiocoap")
+                continue
+            dependencies[dependency] = is_dependency_installed(dependency)
+        return dependencies
+
+    def add_exp_runners(self, tool, runner):
+        """Add experiment runner object"""
+        if tool in self.tools:
+            self.exp_runners[self.tools.index(tool)].extend(runner)
 
     def __repr__(self):
         classname = self.__class__.__name__
