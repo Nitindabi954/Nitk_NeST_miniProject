@@ -9,14 +9,23 @@ from its output
 import re
 import json
 import os
+import logging
 from functools import partial
 from time import strptime, strftime
 from nest.experiment.interrupts import handle_keyboard_interrupt
+from nest.logging_helper import DepedencyCheckFilter
 from .runnerbase import Runner
 from ..results import TcResults
 from ...topology_map import TopologyMap
 from ...engine.tc import get_tc_version
 from ...engine.iterators import run_tc
+
+
+logger = logging.getLogger(__name__)
+if not any(isinstance(filter, DepedencyCheckFilter) for filter in logger.filters):
+    # Duplicate filter is added to avoid logging of same error
+    # messages incase any of the tools is not installed
+    logger.addFilter(DepedencyCheckFilter())
 
 
 class TcRunner(Runner):
@@ -371,3 +380,36 @@ class TcRunner(Runner):
         # Store parsed results
         dev_name = TopologyMap.get_device(self.ns_id, self.dev).name
         TcResults.add_result(self.ns_id, {dev_name: aggregate_stats})
+
+    def setup_tc_runners(self, dependency, qdisc_stats, exp_end):
+        """
+        setup TcRunners for collecting qdisc statistics
+
+        Parameters
+        ----------
+        dependency: int
+            whether tc is installed
+        qdisc_stats: dict
+            info regarding nodes to run tc on
+        exp_end: float
+            time to stop running tc
+        Returns
+        -------
+        workers: List[multiprocessing.Process]
+            Processes to run tc at nodes
+        runners: List[TcRunners]
+        """
+        runners = []
+        if dependency and len(qdisc_stats) > 0:
+            logger.info("Running tc on requested interfaces...")
+            for qdisc_stat in qdisc_stats:
+                tc_runner = TcRunner(
+                    qdisc_stat["ns_id"],
+                    qdisc_stat["int_id"],
+                    qdisc_stat["qdisc"],
+                    exp_end,
+                )
+                runners.append(tc_runner)
+        elif not dependency:
+            logger.warning("tc not found. Qdisc stats will not be collected")
+        return runners

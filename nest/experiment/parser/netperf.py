@@ -19,6 +19,8 @@ from ...engine.netperf import run_netperf, run_netserver
 
 logger = logging.getLogger(__name__)
 
+# pylint: disable-msg=too-many-locals
+
 
 class NetperfRunner(Runner):
     """
@@ -197,3 +199,119 @@ class NetperfRunner(Runner):
         stats_dict = {f"{destination_ip}:{remote_port}": stats_list}
 
         NetperfResults.add_result(self.ns_id, stats_dict)
+
+    # Helper methods
+    # pylint: disable=too-many-arguments
+    def _get_start_stop_time_for_ss(
+        self, src_ns, dst_ns, dst_addr, start_t, stop_t, ss_schedules
+    ):
+        """
+        Find the start time and stop time to run ss command in node `src_ns`
+        to a `dst_addr`
+
+        Parameters
+        ----------
+        src_ns: str
+            ss run from `src_ns`
+        dst_ns: str
+            destination network namespace for ss
+        dst_addr: str
+            Destination address
+        start_t: int
+            Start time of ss command
+        stop_t: int
+            Stop time of ss command
+        ss_schedules: list
+            List with ss command schedules
+
+        Returns
+        -------
+        List: Updated ss_schedules
+        """
+        if (src_ns, dst_ns, dst_addr) not in ss_schedules:
+            ss_schedules[(src_ns, dst_ns, dst_addr)] = (start_t, stop_t)
+        else:
+            (min_start, max_stop) = ss_schedules[(src_ns, dst_ns, dst_addr)]
+            ss_schedules[(src_ns, dst_ns, dst_addr)] = (
+                min(min_start, start_t),
+                max(max_stop, stop_t),
+            )
+
+        return ss_schedules
+
+    def setup_tcp_flows(self, dependency, flow, ss_schedules, destination_nodes):
+        """
+        Setup netperf to run tcp flows
+        Parameters
+        ----------
+        dependency: int
+            whether netperf is installed
+        flow: Flow
+            Flow parameters
+        ss_schedules:
+            ss_schedules so far
+        destination_nodes:
+            Destination nodes so far already running netperf server
+
+        Returns
+        -------
+        dependency: int
+            updated dependency in case netperf is not installed
+        netperf_runners: List[NetperfRunner]
+            all the netperf flows generated
+        workers: List[multiprocessing.Process]
+            Processes to run netperf flows
+        ss_schedules: dict
+            updated ss_schedules
+        """
+        netperf_runners = []
+        if not dependency:
+            logger.warning("Netperf not found. Tcp flows cannot be generated")
+        else:
+            # Get flow attributes
+            [
+                src_ns,
+                dst_ns,
+                dst_addr,
+                start_t,
+                stop_t,
+                n_flows,
+                options,
+            ] = flow._get_props()  # pylint: disable=protected-access
+
+            # Run netserver if not already run before on given dst_node
+            if dst_ns not in destination_nodes:
+                NetperfRunner.run_netserver(dst_ns)
+
+            src_name = TopologyMap.get_namespace(src_ns)["name"]
+
+            netperf_options = {}
+            netperf_options["testname"] = "TCP_STREAM"
+            netperf_options["cong_algo"] = options["cong_algo"]
+            f_flow = "flow" if n_flows == 1 else "flows"
+            logger.info(
+                "Running %s netperf %s from %s to %s...",
+                n_flows,
+                f_flow,
+                src_name,
+                dst_addr,
+            )
+
+            # Create new processes to be run simultaneously
+            for _ in range(n_flows):
+                runner_obj = NetperfRunner(
+                    src_ns,
+                    dst_addr,
+                    start_t,
+                    stop_t - start_t,
+                    dst_ns,
+                    **netperf_options,
+                )
+                netperf_runners.append(runner_obj)
+
+            # Find the start time and stop time to run ss command in `src_ns` to a `dst_addr`
+            ss_schedules = self._get_start_stop_time_for_ss(
+                src_ns, dst_ns, dst_addr, start_t, stop_t, ss_schedules
+            )
+
+        return netperf_runners, ss_schedules

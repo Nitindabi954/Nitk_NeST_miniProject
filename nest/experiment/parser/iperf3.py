@@ -9,9 +9,11 @@ from time import sleep
 from functools import partial
 import json
 import logging
+from multiprocessing import Process
 
 from nest.experiment.interrupts import handle_keyboard_interrupt
 from nest.experiment.pack import Pack
+from nest.topology_map import TopologyMap
 from ..results import Iperf3Results, Iperf3ServerResults
 from .runnerbase import Runner
 from ...engine.iperf3 import run_iperf_server, run_iperf_client
@@ -239,6 +241,67 @@ class Iperf3Runner(Runner):
             "packets": str(stream["packets"]),
         }
 
+    def setup_udp_flows(self, dependency, flow):
+        """
+        Setup iperf3 to run udp flows
+
+        Parameters
+        ----------
+        dependency: int
+            whether iperf3 is installed
+        flow: Flow
+            Flow parameters
+        destination_nodes:
+            Destination nodes so far already running iperf3 server
+
+        Returns
+        -------
+        dependency: int
+            updated dependency in case iproute2 is not installed
+        iperf3_runners: List[NetperfRunner]
+            all the iperf3 udp flows generated
+        workers: List[multiprocessing.Process]
+            Processes to run iperf3 udp flows
+        """
+        iperf3_runners = []
+        if not dependency:
+            logger.warning("Iperf3 not found. Udp flows cannot be generated")
+        else:
+            # Get flow attributes
+            [
+                src_ns,
+                dst_ns,
+                dst_addr,
+                start_t,
+                stop_t,
+                n_flows,
+                options,
+            ] = flow._get_props()  # pylint: disable=protected-access
+
+            src_name = TopologyMap.get_namespace(src_ns)["name"]
+            f_flow = "flow" if n_flows == 1 else "flows"
+            logger.info(
+                "Running %s udp %s from %s to %s...",
+                n_flows,
+                f_flow,
+                src_name,
+                dst_addr,
+            )
+
+            runner_obj = Iperf3Runner(
+                src_ns,
+                dst_addr,
+                options["target_bw"],
+                n_flows,
+                start_t,
+                stop_t - start_t,
+                dst_ns,
+            )
+            runner_obj.setup_iperf3_client(options)
+            iperf3_runners.append(runner_obj)
+
+        return iperf3_runners
+
 
 class Iperf3ServerRunner(Runner):
     """
@@ -412,3 +475,28 @@ class Iperf3ServerRunner(Runner):
             "bytes": str(stream["bytes"]),
             "packets": str(stream["packets"]),
         }
+
+    def run_server(self, iperf3options, exp_end_t):
+        """
+        Run and wait for all server to start
+
+        Parameters
+        ----------
+        iperf3options: dict
+            start server with iperf3 server options
+        exp_end_t: int
+            experiment completion time
+        """
+        # Start server
+        server_list = []
+        for dst_ns in iperf3options:
+            for dst_port in iperf3options[dst_ns]:
+                runner_obj = Iperf3ServerRunner(dst_ns, exp_end_t)
+                runner_obj.setup_iperf3_server(iperf3options[dst_ns][dst_port])
+                server_list.append(runner_obj)
+
+        for server in server_list:
+            process = Process(target=server.run)
+            process.start()
+
+        return server_list

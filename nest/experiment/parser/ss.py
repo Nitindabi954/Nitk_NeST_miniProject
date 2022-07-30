@@ -6,13 +6,21 @@ Runs ss command and parses socket stats from
 its output
 """
 
+import logging
 import os
 import re
 from functools import partial
+from nest.logging_helper import DepedencyCheckFilter
 from nest.experiment.interrupts import handle_keyboard_interrupt
 from ..results import SsResults
 from .runnerbase import Runner
 from ...engine.iterators import run_ss
+
+logger = logging.getLogger(__name__)
+if not any(isinstance(filter, DepedencyCheckFilter) for filter in logger.filters):
+    # Duplicate filter is added to avoid logging of same error
+    # messages incase any of the tools is not installed
+    logger.addFilter(DepedencyCheckFilter())
 
 
 class SsRunner(Runner):
@@ -70,6 +78,43 @@ class SsRunner(Runner):
         """
         self.filter = ss_filter
         super().__init__(ns_id, start_time, run_time, destination_ip, dst_ns)
+
+    def setup_ss_runners(self, dependency, ss_schedules, ss_filter):
+        """
+        setup SsRunners for collecting tcp socket statistics
+
+        Parameters
+        ----------
+        dependency: int
+            whether ss is installed
+        ss_schedules: dict
+            start time and end time for SsRunners
+
+        Returns
+        -------
+        workers: List[multiprocessing.Process]
+            Processes to run ss at nodes
+        runners: List[SsRunners]
+        """
+        runners = []
+        if dependency:
+            logger.info("Running ss on nodes...")
+            for key, timings in ss_schedules.items():
+                src_ns = key[0]
+                dst_ns = key[1]
+                dst_addr = key[2]
+                ss_runner = SsRunner(
+                    src_ns,
+                    dst_addr,
+                    timings[0],
+                    timings[1] - timings[0],
+                    dst_ns,
+                    ss_filter=ss_filter,
+                )
+                runners.append(ss_runner)
+        else:
+            logger.warning("ss not found. Sockets stats will not be collected")
+        return runners
 
     def run(self):
         """

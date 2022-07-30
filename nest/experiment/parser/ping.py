@@ -4,12 +4,21 @@
 """Runs and provides RTT output from ping command"""
 
 import re
+import logging
 from time import sleep
 from functools import partial
+from nest.logging_helper import DepedencyCheckFilter
 from nest.experiment.interrupts import handle_keyboard_interrupt
 from .runnerbase import Runner
 from ..results import PingResults
 from ...engine.ping import run_exp_ping
+
+
+logger = logging.getLogger(__name__)
+if not any(isinstance(filter, DepedencyCheckFilter) for filter in logger.filters):
+    # Duplicate filter is added to avoid logging of same error
+    # messages incase any of the tools is not installed
+    logger.addFilter(DepedencyCheckFilter())
 
 
 class PingRunner(Runner):
@@ -91,3 +100,34 @@ class PingRunner(Runner):
         stats_dict = {self.destination_address.get_addr(with_subnet=False): stats_list}
 
         PingResults.add_result(self.ns_id, stats_dict)
+
+    def setup_ping_runners(self, dependency, ping_schedules):
+        """
+        setup PingRunners for collecting latency
+
+        Parameters
+        ----------
+        dependency: int
+            whether ping is installed
+        ping_schedules: dict
+            start time and end time for PingRunners
+
+        Returns
+        -------
+        workers: List[multiprocessing.Process]
+            Processes to run ss at nodes
+        runners: List[PingRunner]
+        """
+        runners = []
+        if dependency:
+            for key, timings in ping_schedules.items():
+                src_ns = key[0]
+                dst_ns = key[1]
+                dst_addr = key[2]
+                ping_runner = PingRunner(
+                    src_ns, dst_addr, timings[0], timings[1] - timings[0], dst_ns
+                )
+                runners.append(ping_runner)
+        else:
+            logger.warning("ping not found.")
+        return runners

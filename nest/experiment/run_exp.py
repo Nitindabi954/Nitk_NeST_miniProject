@@ -4,15 +4,15 @@
 """Script to be run for running experiments on topology"""
 
 from multiprocessing import Process
-from collections import namedtuple, defaultdict
+from collections import defaultdict
 import logging
 import os
+from sys import int_info
 from time import sleep
 from tqdm import tqdm
 
 from nest.logging_helper import DepedencyCheckFilter
 from nest import config
-from nest.topology_map import TopologyMap
 from nest.experiment.tools import Tools
 from nest.clean_up import kill_processes, tcp_modules_clean_up
 from nest import engine
@@ -20,13 +20,11 @@ from .pack import Pack
 
 # Import results
 from .results import (
-    Iperf3ServerResults,
     SsResults,
     NetperfResults,
     Iperf3Results,
     TcResults,
     PingResults,
-    CoAPResults,
     DumpResults,
 )
 
@@ -44,7 +42,6 @@ from .plotter.netperf import plot_netperf
 from .plotter.iperf3 import plot_iperf3
 from .plotter.tc import plot_tc
 from .plotter.ping import plot_ping
-from ..engine.util import is_dependency_installed, is_package_installed
 
 logger = logging.getLogger(__name__)
 if not any(isinstance(filter, DepedencyCheckFilter) for filter in logger.filters):
@@ -97,7 +94,6 @@ def run_experiment(exp):
             _,
             options,
         ] = flow._get_props()  # pylint: disable=protected-access
-
         exp_end_t = max(exp_end_t, stop_t)
 
         (min_start, max_stop) = ping_schedules[(src_ns, dst_ns, dst_addr)]
@@ -115,14 +111,22 @@ def run_experiment(exp):
             #   connection also we must ignore.
             ss_filters.add("sport != 12865 and dport != 12865")
             ss_required = True
-            (tcp_runners, ss_schedules,)= setup_tcp_flows(
+
+            netperf_options = {
+                "testname": "TCP_STREAM",
+                "cong_algo": options["cong_algo"],
+            }
+            NetperfRunner_obj = NetperfRunner(
+                src_ns, dst_addr, start_t, stop_t - start_t, dst_ns, **netperf_options
+            )
+            (tcp_runners, ss_schedules,) = NetperfRunner_obj.setup_tcp_flows(
                 dependencies["netperf"],
                 flow,
                 ss_schedules,
                 destination_nodes["netperf"],
             )
 
-            tools.add_exp_runners("netperf",tcp_runners)
+            tools.add_exp_runners("netperf", tcp_runners)
 
             # Update destination nodes
             destination_nodes["netperf"].add(dst_ns)
@@ -134,8 +138,18 @@ def run_experiment(exp):
             #   there can be another flow in the reverse direction whose control
             #   connection also we must ignore.
             ss_filters.add("sport != 5201 and dport != 5201")
-            udp_runners = setup_udp_flows(dependencies["iperf3"], flow)
-            tools.add_exp_runners("iperf3",udp_runners)
+
+            udp_runners_obj = Iperf3Runner(
+                src_ns,
+                dst_addr,
+                options["target_bw"],
+                flow,
+                start_t,
+                stop_t - start_t,
+                dst_ns,
+            )
+            udp_runners = udp_runners_obj.setup_udp_flows(dependencies["iperf3"], flow)
+            tools.add_exp_runners("iperf3", udp_runners)
 
             # Update destination nodes
             destination_nodes["iperf3"].add(dst_ns)
@@ -144,42 +158,59 @@ def run_experiment(exp):
                 dst_port_options.update(iperf3_options.get(dst_ns))
             iperf3_options.update({dst_ns: dst_port_options})
 
-    server_runner = run_server(iperf3_options, exp_end_t)
+        Iperf3ServerRunner_obj = Iperf3ServerRunner(dst_ns, exp_end_t)
+        server_runner = Iperf3ServerRunner_obj.run_server(iperf3_options, exp_end_t)
 
     for coap_flow in exp.coap_flows:
         [
             src_ns,
             dst_ns,
             dst_addr,
-            _,
-            _,
+            start_t,
+            stop_t,
             _,
         ] = coap_flow._get_props()  # pylint: disable=protected-access
 
         config.set_value("show_progress_bar", False)
 
         # Setup runners for emulating CoAP traffic
-        coap_runners = setup_coap_runners(
+
+        coap_runners = CoAPRunner.setup_coap_runners(
             dependencies["coap"], coap_flow, destination_nodes["coap"]
         )
-        tools.add_exp_runners("coap",coap_runners)
+        tools.add_exp_runners("coap", coap_runners)
         destination_nodes["coap"].add(dst_ns)
 
     if ss_required:
         ss_filter = " and ".join(ss_filters)
-        ss_runners = setup_ss_runners(dependencies["ss"], ss_schedules, ss_filter)
-        tools.add_exp_runners("ss",ss_runners)
+        # Creating SsRunner Object
+        ss_runner_obj = SsRunner(
+            src_ns,
+            dst_addr,
+            start_t,
+            stop_t - start_t,
+            dst_ns,
+            ss_filter=ss_filter,
+        )
+        ss_runners = ss_runner_obj.setup_ss_runners(
+            dependencies["ss"], ss_schedules, ss_filter
+        )
+        tools.add_exp_runners("ss", ss_runners)
 
-    tc_runners = setup_tc_runners(dependencies["tc"], exp.qdisc_stats, exp_end_t)
-    tools.add_exp_runners("tc",tc_runners)
+    tc_runner_obj = TcRunner(src_ns, int_info, exp.qdisc_stats, exp_end_t)
+    tc_runners = tc_runner_obj.setup_tc_runners(
+        dependencies["tc"], exp.qdisc_stats, exp_end_t
+    )
+    tools.add_exp_runners("tc", tc_runners)
 
-    ping_runners = setup_ping_runners(dependencies["ping"], ping_schedules)
-    tools.add_exp_runners("ping",ping_runners)
+    ping_runner_obj = PingRunner(src_ns, dst_addr, start_t, stop_t - start_t, dst_ns)
+    ping_runners = ping_runner_obj.setup_ping_runners(
+        dependencies["ping"], ping_schedules
+    )
+    tools.add_exp_runners("ping", ping_runners)
 
     try:
         # Start traffic generation
-        #run_workers(setup_flow_workers(tools.exp_runners, exp_end_t))
-
         workers_flow = []
         for runners in tools.exp_runners:
             workers_flow.extend([Process(target=runner.run) for runner in runners])
@@ -190,15 +221,12 @@ def run_experiment(exp):
 
         run_workers(workers_flow)
 
-       
-
-
         logger.info("Parsing statistics...")
 
-        tools.add_exp_runners("server",server_runner)
+        tools.add_exp_runners("server", server_runner)
 
         # Parse the stored statistics
-        #run_workers(setup_parser_workers(tools.exp_runners))
+        # run_workers(setup_parser_workers(tools.exp_runners))
 
         workers_parser = []
         for runners in tools.exp_runners:
@@ -273,32 +301,6 @@ def tcp_modules_helper(exp):
                     engine.load_tcp_module(cong_algo, params_string)
 
 
-def run_server(iperf3options, exp_end_t):
-    """
-    Run and wait for all server to start
-
-    Parameters
-    ----------
-    iperf3options: dict
-        start server with iperf3 server options
-    exp_end_t: int
-        experiment completion time
-    """
-    # Start server
-    server_list = []
-    for dst_ns in iperf3options:
-        for dst_port in iperf3options[dst_ns]:
-            runner_obj = Iperf3ServerRunner(dst_ns, exp_end_t)
-            runner_obj.setup_iperf3_server(iperf3options[dst_ns][dst_port])
-            server_list.append(runner_obj)
-
-    for server in server_list:
-        process = Process(target=server.run)
-        process.start()
-
-    return server_list
-
-
 def run_workers(workers):
     """
     Run and wait for processes to finish
@@ -325,320 +327,16 @@ def setup_plotter_workers():
     -------
     List[multiprocessing.Process]
         plotters
-    
-    """
-    """
-    plotters = [("plot_ss", SsResults), ("plot_netperf", NetperfResults), 
-            ("plot_iperf3", Iperf3Results), ("plot_tc", TcResults), ("plot_ping", PingResults)]
 
-    return [Process(target=plotter[0], args=(plotter[1].get_results(),)) for plotter in plotters]
-    
     """
-    plotters = []
 
-    plotters.append(Process(target=plot_ss, args=(SsResults.get_results(),)))
+    plotters = [Process(target=plot_ss, args=(SsResults.get_results(),))]
     plotters.append(Process(target=plot_netperf, args=(NetperfResults.get_results(),)))
     plotters.append(Process(target=plot_iperf3, args=(Iperf3Results.get_results(),)))
     plotters.append(Process(target=plot_tc, args=(TcResults.get_results(),)))
     plotters.append(Process(target=plot_ping, args=(PingResults.get_results(),)))
 
     return plotters
-
-
-def setup_tcp_flows(dependency, flow, ss_schedules, destination_nodes):
-    """
-    Setup netperf to run tcp flows
-    Parameters
-    ----------
-    dependency: int
-        whether netperf is installed
-    flow: Flow
-        Flow parameters
-    ss_schedules:
-        ss_schedules so far
-    destination_nodes:
-        Destination nodes so far already running netperf server
-
-    Returns
-    -------
-    dependency: int
-        updated dependency in case netperf is not installed
-    netperf_runners: List[NetperfRunner]
-        all the netperf flows generated
-    workers: List[multiprocessing.Process]
-        Processes to run netperf flows
-    ss_schedules: dict
-        updated ss_schedules
-    """
-    netperf_runners = []
-    if not dependency:
-        logger.warning("Netperf not found. Tcp flows cannot be generated")
-    else:
-        # Get flow attributes
-        [
-            src_ns,
-            dst_ns,
-            dst_addr,
-            start_t,
-            stop_t,
-            n_flows,
-            options,
-        ] = flow._get_props()  # pylint: disable=protected-access
-
-        # Run netserver if not already run before on given dst_node
-        if dst_ns not in destination_nodes:
-            NetperfRunner.run_netserver(dst_ns)
-
-        src_name = TopologyMap.get_node(src_ns).name
-
-        netperf_options = {}
-        netperf_options["testname"] = "TCP_STREAM"
-        netperf_options["cong_algo"] = options["cong_algo"]
-        f_flow = "flow" if n_flows == 1 else "flows"
-        logger.info(
-            "Running %s netperf %s from %s to %s...",
-            n_flows,
-            f_flow,
-            src_name,
-            dst_addr,
-        )
-
-        # Create new processes to be run simultaneously
-        for _ in range(n_flows):
-            runner_obj = NetperfRunner(
-                src_ns, dst_addr, start_t, stop_t - start_t, dst_ns, **netperf_options
-            )
-            netperf_runners.append(runner_obj)
-
-        # Find the start time and stop time to run ss command in `src_ns` to a `dst_addr`
-        ss_schedules = _get_start_stop_time_for_ss(
-            src_ns, dst_ns, dst_addr, start_t, stop_t, ss_schedules
-        )
-
-    return netperf_runners, ss_schedules
-
-
-def setup_udp_flows(dependency, flow):
-    """
-    Setup iperf3 to run udp flows
-
-    Parameters
-    ----------
-    dependency: int
-        whether iperf3 is installed
-    flow: Flow
-        Flow parameters
-    destination_nodes:
-        Destination nodes so far already running iperf3 server
-
-    Returns
-    -------
-    dependency: int
-        updated dependency in case iproute2 is not installed
-    iperf3_runners: List[NetperfRunner]
-        all the iperf3 udp flows generated
-    workers: List[multiprocessing.Process]
-        Processes to run iperf3 udp flows
-    """
-    iperf3_runners = []
-    if not dependency:
-        logger.warning("Iperf3 not found. Udp flows cannot be generated")
-    else:
-        # Get flow attributes
-        [
-            src_ns,
-            dst_ns,
-            dst_addr,
-            start_t,
-            stop_t,
-            n_flows,
-            options,
-        ] = flow._get_props()  # pylint: disable=protected-access
-
-        src_name = TopologyMap.get_node(src_ns).name
-        f_flow = "flow" if n_flows == 1 else "flows"
-        logger.info(
-            "Running %s udp %s from %s to %s...", n_flows, f_flow, src_name, dst_addr
-        )
-
-        runner_obj = Iperf3Runner(
-            src_ns,
-            dst_addr,
-            options["target_bw"],
-            n_flows,
-            start_t,
-            stop_t - start_t,
-            dst_ns,
-        )
-        runner_obj.setup_iperf3_client(options)
-        iperf3_runners.append(runner_obj)
-
-    return iperf3_runners
-
-
-def setup_ss_runners(dependency, ss_schedules, ss_filter):
-    """
-    setup SsRunners for collecting tcp socket statistics
-
-    Parameters
-    ----------
-    dependency: int
-        whether ss is installed
-    ss_schedules: dict
-        start time and end time for SsRunners
-
-    Returns
-    -------
-    workers: List[multiprocessing.Process]
-        Processes to run ss at nodes
-    runners: List[SsRunners]
-    """
-    runners = []
-    if dependency:
-        logger.info("Running ss on nodes...")
-        for key, timings in ss_schedules.items():
-            src_ns = key[0]
-            dst_ns = key[1]
-            dst_addr = key[2]
-            ss_runner = SsRunner(
-                src_ns,
-                dst_addr,
-                timings[0],
-                timings[1] - timings[0],
-                dst_ns,
-                ss_filter=ss_filter,
-            )
-            runners.append(ss_runner)
-    else:
-        logger.warning("ss not found. Sockets stats will not be collected")
-    return runners
-
-
-def setup_tc_runners(dependency, qdisc_stats, exp_end):
-    """
-    setup TcRunners for collecting qdisc statistics
-
-    Parameters
-    ----------
-    dependency: int
-        whether tc is installed
-    qdisc_stats: dict
-        info regarding nodes to run tc on
-    exp_end: float
-        time to stop running tc
-    Returns
-    -------
-    workers: List[multiprocessing.Process]
-        Processes to run tc at nodes
-    runners: List[TcRunners]
-    """
-    runners = []
-    if dependency and len(qdisc_stats) > 0:
-        logger.info("Running tc on requested interfaces...")
-        for qdisc_stat in qdisc_stats:
-            tc_runner = TcRunner(
-                qdisc_stat["ns_id"], qdisc_stat["int_id"], qdisc_stat["qdisc"], exp_end
-            )
-            runners.append(tc_runner)
-    elif not dependency:
-        logger.warning("tc not found. Qdisc stats will not be collected")
-    return runners
-
-
-def setup_ping_runners(dependency, ping_schedules):
-    """
-    setup PingRunners for collecting latency
-
-    Parameters
-    ----------
-    dependency: int
-        whether ping is installed
-    ping_schedules: dict
-        start time and end time for PingRunners
-
-    Returns
-    -------
-    workers: List[multiprocessing.Process]
-        Processes to run ss at nodes
-    runners: List[PingRunner]
-    """
-    runners = []
-    if dependency:
-        for key, timings in ping_schedules.items():
-            src_ns = key[0]
-            dst_ns = key[1]
-            dst_addr = key[2]
-            ping_runner = PingRunner(
-                src_ns, dst_addr, timings[0], timings[1] - timings[0], dst_ns
-            )
-            runners.append(ping_runner)
-    else:
-        logger.warning("ping not found.")
-    return runners
-
-
-def setup_coap_runners(dependency, flow, destination_nodes):
-    """
-    Setup CoAPRunner objects for generating CoAP traffic
-
-    Parameters
-    ----------
-    dependency : int
-        Whether aiocoap is installed
-    flow : CoapFlow
-        The CoapFlow object
-    destination_nodes:
-        Destination nodes so far already running CoAP server
-
-    Returns
-    -------
-    runners : List[CoAPRunner]
-        List of CoAPRunner objects for the current flow object
-    """
-    runners = []
-
-    # If aiocoap is installed
-    if dependency:
-        # Get flow attributes
-        [
-            src_ns,
-            dst_ns,
-            dst_addr,
-            n_con_msgs,
-            n_non_msgs,
-            user_options,
-        ] = flow._get_props()  # pylint: disable=protected-access
-
-        # Run CoAP server if not already run before on given dst_node
-        if dst_ns not in destination_nodes:
-
-            # If user has not supplied the user options
-            if user_options is not None:
-                # Creating the options string for running the CoAP server
-                if (
-                    "coap_server_content" in user_options.keys()
-                    and user_options["coap_server_content"] != ""
-                ):
-                    server_content = '"' + user_options["coap_server_content"] + '"'
-                    server_options = f"-c {server_content}"
-                else:
-                    server_options = None
-            else:
-                server_options = None
-
-            # Running the server
-            CoAPRunner.run_server(dst_ns, server_options)
-
-        # Create the CoAPRunner object
-        coap_runner = CoAPRunner(src_ns, dst_addr, user_options, n_con_msgs, n_non_msgs)
-        runners.append(coap_runner)
-
-    # If aiocoap is not installed
-    else:
-        logger.warning("aiocoap not found for CoAP emulation.")
-
-    # Return the list of runners
-    return runners
 
 
 def progress_bar(stop_time, precision=1):
@@ -678,43 +376,3 @@ def cleanup():
     # Clean up the configured TCP modules and kill processes
     tcp_modules_clean_up()
     kill_processes()
-
-# Helper methods
-# pylint: disable=too-many-arguments
-def _get_start_stop_time_for_ss(
-    src_ns, dst_ns, dst_addr, start_t, stop_t, ss_schedules
-):
-    """
-    Find the start time and stop time to run ss command in node `src_ns`
-    to a `dst_addr`
-
-    Parameters
-    ----------
-    src_ns: str
-        ss run from `src_ns`
-    dst_ns: str
-        destination network namespace for ss
-    dst_addr: str
-        Destination address
-    start_t: int
-        Start time of ss command
-    stop_t: int
-        Stop time of ss command
-    ss_schedules: list
-        List with ss command schedules
-
-    Returns
-    -------
-    List: Updated ss_schedules
-    """
-    if (src_ns, dst_ns, dst_addr) not in ss_schedules:
-        ss_schedules[(src_ns, dst_ns, dst_addr)] = (start_t, stop_t)
-    else:
-        (min_start, max_stop) = ss_schedules[(src_ns, dst_ns, dst_addr)]
-        ss_schedules[(src_ns, dst_ns, dst_addr)] = (
-            min(min_start, start_t),
-            max(max_stop, stop_t),
-        )
-
-    return ss_schedules
-

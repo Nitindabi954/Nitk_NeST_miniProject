@@ -204,3 +204,69 @@ class CoAPRunner(Runner):
             self.ns_id,
             {destination_ip: {"output": parsed_stats_out, "error": parsed_stats_err}},
         )
+
+    @staticmethod
+    def setup_coap_runners(dependency, flow, destination_nodes):
+        """
+        Setup CoAPRunner objects for generating CoAP traffic
+
+        Parameters
+        ----------
+        dependency : int
+            Whether aiocoap is installed
+        flow : CoapFlow
+            The CoapFlow object
+        destination_nodes:
+            Destination nodes so far already running CoAP server
+
+        Returns
+        -------
+        runners : List[CoAPRunner]
+            List of CoAPRunner objects for the current flow object
+        """
+        runners = []
+
+        # If aiocoap is installed
+        if dependency:
+            # Get flow attributes
+            [
+                src_ns,
+                dst_ns,
+                dst_addr,
+                n_con_msgs,
+                n_non_msgs,
+                user_options,
+            ] = flow._get_props()  # pylint: disable=protected-access
+
+            # Run CoAP server if not already run before on given dst_node
+            if dst_ns not in destination_nodes:
+
+                # If user has not supplied the user options
+                if user_options is not None:
+                    # Creating the options string for running the CoAP server
+                    if (
+                        "coap_server_content" in user_options.keys()
+                        and user_options["coap_server_content"] != ""
+                    ):
+                        server_content = '"' + user_options["coap_server_content"] + '"'
+                        server_options = f"-c {server_content}"
+                    else:
+                        server_options = None
+                else:
+                    server_options = None
+
+                # Running the server
+                CoAPRunner.run_server(dst_ns, server_options)
+
+            # Create the CoAPRunner object
+            coap_runner = CoAPRunner(
+                src_ns, dst_addr, user_options, n_con_msgs, n_non_msgs
+            )
+            runners.append(coap_runner)
+
+        # If aiocoap is not installed
+        else:
+            logger.warning("aiocoap not found for CoAP emulation.")
+
+        # Return the list of runners
+        return runners

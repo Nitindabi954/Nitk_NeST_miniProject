@@ -5,6 +5,7 @@
     "disable_dad": true,
     "log_level": "INFO",
     "plot_results": true,
+    "editor.codeLens": true,
     "readme_in_stats_folder": true,
     "show_progress_bar": true,
     "show_tcp_module_parameter_confirmation": true,
